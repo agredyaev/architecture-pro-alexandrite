@@ -1,0 +1,193 @@
+@startuml
+title Изменение статуса заказа и инвалидация кеша
+
+
+!pragma layout smetana
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Sequence.puml
+!include p3-c4-styles.puml
+
+AddElementTag("CacheOrchestrator", $borderColor=C_ORANGE400, $fontColor=C_TEXT)
+AddElementTag("CacheStore", $borderColor=C_EMERALD400, $fontColor=C_TEXT)
+AddElementTag("PrimaryStore", $borderColor=C_AMBER400, $fontColor=C_TEXT)
+AddElementTag("CacheActor", $borderColor=C_SKY400, $fontColor=C_TEXT)
+
+AddRelTag("CacheLookup", $lineColor=C_SKY400)
+AddRelTag("CacheHit", $lineColor=C_EMERALD400)
+AddRelTag("CacheMiss", $lineColor=C_AMBER400)
+AddRelTag("CacheFill", $lineColor=C_TEAL400)
+AddRelTag("CacheInvalidate", $lineColor=C_ROSE400)
+AddRelTag("DbRead", $lineColor=C_PRI600)
+AddRelTag("DbUpdate", $lineColor=C_PRI700)
+
+actor Operator as op <<CacheActor>>
+participant "MES UI" as ui
+participant "MES API" as api <<CacheOrchestrator>>
+database "Redis Cache" as redis <<CacheStore>>
+database "MES DB" as db <<PrimaryStore>>
+
+== Сценарий: Оператор берёт заказ в работу (изменение статуса) ==
+
+Rel(op, ui, "Нажимает 'Взять в работу'\\nна заказе ORDER-123", "", "", "", "", "", "", "->")
+activate ui
+
+Rel(ui, api, "PUT /api/orders/123/status\\nBODY: status=MANUFACTURING_STARTED, operator_id=5", "", "", "", "", "", "", "->")
+activate api
+
+note right of api
+  Обновление статуса заказа
+  С MANUFACTURING_APPROVED
+  На MANUFACTURING_STARTED
+end note
+
+Rel(api, db, "UPDATE orders\\nSET status = 'MANUFACTURING_STARTED',\\n    operator_id = 5,\\n    updated_at = NOW()\\nWHERE id = 123", "", "", "", "DbUpdate")
+activate db
+
+Rel(db, api, "OK (1 row updated)", "", "", "", "DbUpdate", "", "", "-->")
+deactivate db
+
+note right of api
+  **Стратегия 1: TTL (текущая реализация)**
+  НЕ инвалидируем кеш
+  Данные обновятся по истечении TTL (10 сек)
+end note
+
+Rel(api, ui, "200 OK\\norder_id=123, status=MANUFACTURING_STARTED", "", "", "", "", "", "", "-->")
+deactivate api
+
+Rel(ui, op, "Заказ взят в работу\\nСтатус обновлён", "", "", "", "", "", "", "-->")
+deactivate ui
+
+== Проверка: другой оператор открывает дашборд ==
+
+note over op, db
+  Через 2 секунды после обновления
+  (TTL ещё не истёк)
+end note
+
+Rel(op, ui, "Оператор 2 открывает дашборд\\nGET /orders?status=MANUFACTURING_APPROVED", "", "", "", "", "", "", "->")
+activate ui
+
+Rel(ui, api, "GET /api/orders?status=MANUFACTURING_APPROVED&page=0", "", "", "", "CacheLookup")
+activate api
+
+Rel(api, redis, "GET orders:list:status:MANUFACTURING_APPROVED:page:0", "", "", "", "CacheLookup")
+activate redis
+
+Rel(redis, api, "HIT: [{ORDER-123: MANUFACTURING_APPROVED}, ...]", "", "", "", "CacheHit", "", "", "-->")
+deactivate redis
+
+note right of api
+  **Stale data!**
+  ORDER-123 уже имеет статус MANUFACTURING_STARTED,
+  но кеш ещё содержит старые данные
+
+  TTL истечёт через ~8 секунд
+  Допустимо для бизнеса
+end note
+
+Rel(api, ui, "200 OK\\n[{ORDER-123: MANUFACTURING_APPROVED}, ...]", "", "", "", "", "", "", "-->")
+deactivate api
+
+Rel(ui, op, "**Видит ORDER-123** в списке\\n(stale data, ещё 8 сек)", "", "", "", "", "", "", "-->")
+deactivate ui
+
+note over op, db
+  Через 10 секунд от первого обновления
+  TTL истекает
+end note
+
+== После истечения TTL (10 секунд) ==
+
+Rel(op, ui, "Оператор 3 открывает дашборд\\nGET /orders?status=MANUFACTURING_APPROVED", "", "", "", "", "", "", "->")
+activate ui
+
+Rel(ui, api, "GET /api/orders?status=MANUFACTURING_APPROVED&page=0", "", "", "", "CacheLookup")
+activate api
+
+Rel(api, redis, "GET orders:list:status:MANUFACTURING_APPROVED:page:0", "", "", "", "CacheLookup")
+activate redis
+
+Rel(redis, api, "MISS: null\\n(TTL истёк, ключ удалён)", "", "", "", "CacheMiss", "", "", "-->")
+deactivate redis
+
+Rel(api, db, "SELECT * FROM orders\\nWHERE status = 'MANUFACTURING_APPROVED'\\nORDER BY created_at DESC\\nLIMIT 20", "", "", "", "DbRead")
+activate db
+
+note right of db
+  ORDER-123 не будет в результате
+  (статус уже MANUFACTURING_STARTED)
+end note
+
+Rel(db, api, "[{ORDER-456}, {ORDER-789}, ...]\\n(БЕЗ ORDER-123)", "", "", "", "DbRead", "", "", "-->")
+deactivate db
+
+Rel(api, redis, "SET orders:list:status:MANUFACTURING_APPROVED:page:0\\nVALUE: [{ORDER-456}, {ORDER-789}, ...]\\nTTL: 10 seconds", "", "", "", "CacheFill")
+activate redis
+Rel(redis, api, "OK", "", "", "", "CacheFill", "", "", "-->")
+deactivate redis
+
+Rel(api, ui, "200 OK\\n[{ORDER-456}, {ORDER-789}, ...]", "", "", "", "", "", "", "-->")
+deactivate api
+
+Rel(ui, op, "**НЕ видит ORDER-123**\\nДанные актуальны", "", "", "", "", "", "", "-->")
+deactivate ui
+
+== Альтернатива: Key-based инвалидация (опционально, следующий этап) ==
+
+note over op, db
+  **Если бизнес требует instant visibility:**
+  Можно добавить явную инвалидацию при обновлении
+end note
+
+Rel(op, ui, "Нажимает 'Взять в работу' на ORDER-999", "", "", "", "", "", "", "->")
+activate ui
+Rel(ui, api, "PUT /api/orders/999/status\\nBODY: status=MANUFACTURING_STARTED", "", "", "", "", "", "", "->")
+activate api
+
+Rel(api, db, "UPDATE orders SET status = 'MANUFACTURING_STARTED' WHERE id = 999", "", "", "", "DbUpdate")
+activate db
+Rel(db, api, "OK", "", "", "", "DbUpdate", "", "", "-->")
+deactivate db
+
+note right of api
+  **Стратегия 2: Key-based инвалидация**
+  Явно удаляем ключи кеша
+end note
+
+Rel(api, redis, "DELETE orders:list:status:MANUFACTURING_APPROVED:page:0", "", "", "", "CacheInvalidate")
+activate redis
+Rel(redis, api, "OK (1 key deleted)", "", "", "", "CacheInvalidate", "", "", "-->")
+deactivate redis
+
+Rel(api, redis, "DELETE orders:stats:statuses", "", "", "", "CacheInvalidate")
+activate redis
+Rel(redis, api, "OK (1 key deleted)", "", "", "", "CacheInvalidate", "", "", "-->")
+deactivate redis
+
+note right of api
+  Следующий запрос → MISS → обновление из БД
+  Instant visibility, но сложнее реализация
+
+  **Компромисс:**
+  - Удаляем только page:0 (не все страницы)
+  - Остальные страницы обновятся по TTL
+end note
+
+api --> ui: 200 OK
+deactivate api
+ui --> op: Заказ взят в работу
+deactivate ui
+
+note over op, db
+  Следующий оператор увидит актуальные данные СРАЗУ
+  (не через 10 секунд)
+end note
+
+legend left
+|<back:C_LINE>              </back>| Стандартная граница |
+|<back:C_ORANGE400>             </back>| Оркестратор Cache-Aside |
+|<back:C_EMERALD400>            </back>| Cache store (Redis) |
+|<back:C_AMBER400>              </back>| Primary store (MES DB) |
+endlegend
+
+@enduml

@@ -1,0 +1,154 @@
+@startuml
+title Чтение списка заказов с кешированием (Cache-Aside)
+
+!pragma layout smetana
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Sequence.puml
+!include p3-c4-styles.puml
+
+AddElementTag("CacheOrchestrator", $borderColor=C_ORANGE400, $fontColor=C_TEXT)
+AddElementTag("CacheStore", $borderColor=C_EMERALD400, $fontColor=C_TEXT)
+AddElementTag("PrimaryStore", $borderColor=C_AMBER400, $fontColor=C_TEXT)
+AddElementTag("CacheActor", $borderColor=C_SKY400, $fontColor=C_TEXT)
+
+AddRelTag("CacheLookup", $lineColor=C_SKY400)
+AddRelTag("CacheHit", $lineColor=C_EMERALD400)
+AddRelTag("CacheMiss", $lineColor=C_AMBER400)
+AddRelTag("CacheFill", $lineColor=C_TEAL400)
+AddRelTag("DbRead", $lineColor=C_PRI600)
+
+
+actor Operator as op <<CacheActor>>
+participant "MES UI" as ui
+participant "MES API" as api <<CacheOrchestrator>>
+database "Redis Cache" as redis <<CacheStore>>
+database "MES DB" as db <<PrimaryStore>>
+
+== Сценарий 1: Cache HIT (кеш содержит данные) ==
+
+Rel(op, ui, "Открывает дашборд\\nGET /orders?status=MANUFACTURING_APPROVED&page=0", "", "", "", "", "", "", "->")
+activate ui
+
+Rel(ui, api, "GET /api/orders?status=MANUFACTURING_APPROVED&page=0", "", "", "", "CacheLookup")
+activate api
+
+note right of api
+  Ключ кеша:
+  orders:list:status:MANUFACTURING_APPROVED:page:0
+end note
+
+Rel(api, redis, "GET orders:list:status:MANUFACTURING_APPROVED:page:0", "", "", "", "CacheLookup")
+activate redis
+
+Rel(redis, api, "HIT: [{order1}, {order2}, ...]", "", "", "", "CacheHit", "", "", "-->")
+deactivate redis
+
+note right of api
+  Кеш содержит данные
+  TTL ещё не истёк (<10 сек)
+  Возвращаем из кеша
+end note
+
+Rel(api, ui, "200 OK\\n[{order1}, {order2}, ...]", "", "", "", "", "", "", "-->")
+deactivate api
+
+Rel(ui, op, "Отображает список заказов\\n**Время: <100 мс**", "", "", "", "", "", "", "-->")
+deactivate ui
+
+== Сценарий 2: Cache MISS (кеш пустой или истёк TTL) ==
+
+Rel(op, ui, "Открывает дашборд\\nGET /orders?status=MANUFACTURING_STARTED&page=0", "", "", "", "", "", "", "->")
+activate ui
+
+Rel(ui, api, "GET /api/orders?status=MANUFACTURING_STARTED&page=0", "", "", "", "CacheLookup")
+activate api
+
+Rel(api, redis, "GET orders:list:status:MANUFACTURING_STARTED:page:0", "", "", "", "CacheLookup")
+activate redis
+
+Rel(redis, api, "MISS: null\\n(ключ отсутствует или истёк TTL)", "", "", "", "CacheMiss", "", "", "-->")
+deactivate redis
+
+note right of api
+  Кеш пустой
+  Идём в БД
+end note
+
+Rel(api, db, "SELECT * FROM orders\\nWHERE status = 'MANUFACTURING_STARTED'\\nORDER BY created_at DESC\\nLIMIT 20 OFFSET 0", "", "", "", "DbRead")
+activate db
+
+Rel(db, api, "[{order3}, {order4}, ...]", "", "", "", "DbRead", "", "", "-->")
+deactivate db
+
+note right of api
+  Сохраняем результат в кеш
+  TTL = 10 секунд
+end note
+
+Rel(api, redis, "SET orders:list:status:MANUFACTURING_STARTED:page:0\\nVALUE: [{order3}, {order4}, ...]\\nTTL: 10 seconds", "", "", "", "CacheFill")
+activate redis
+
+Rel(redis, api, "OK", "", "", "", "CacheFill", "", "", "-->")
+deactivate redis
+
+Rel(api, ui, "200 OK\\n[{order3}, {order4}, ...]", "", "", "", "", "", "", "-->")
+deactivate api
+
+Rel(ui, op, "Отображает список заказов\\n**Время при MISS: ~500-1000 мс**\\n**Следующие 10 сек: <100 мс (HIT)**", "", "", "", "", "", "", "-->")
+deactivate ui
+
+== Сценарий 3: Множественные операторы (преимущества кеша) ==
+
+note over op, db
+  N операторов одновременно открывают дашборд
+  с одинаковым фильтром status=MANUFACTURING_APPROVED
+end note
+
+Rel(op, ui, "Оператор 1: GET /orders?status=MANUFACTURING_APPROVED&page=0", "", "", "", "", "", "", "->")
+activate ui
+Rel(ui, api, "GET /api/orders?status=MANUFACTURING_APPROVED&page=0", "", "", "", "CacheLookup")
+activate api
+Rel(api, redis, "GET ...", "", "", "", "CacheLookup")
+Rel(redis, api, "MISS", "", "", "", "CacheMiss", "", "", "-->")
+Rel(api, db, "SELECT ... (запрос к БД)", "", "", "", "DbRead")
+Rel(db, api, "результат", "", "", "", "DbRead", "", "", "-->")
+Rel(api, redis, "SET ... TTL=10s", "", "", "", "CacheFill")
+Rel(api, ui, "200 OK", "", "", "", "", "", "", "-->")
+deactivate api
+Rel(ui, op, "список заказов", "", "", "", "", "", "", "-->")
+deactivate ui
+
+note over op, db
+  Операторы 2-N запрашивают в течение 10 секунд
+end note
+
+Rel(op, ui, "Операторы 2-N: GET /orders?status=MANUFACTURING_APPROVED&page=0", "", "", "", "", "", "", "->")
+activate ui
+Rel(ui, api, "GET /api/orders?status=MANUFACTURING_APPROVED&page=0", "", "", "", "CacheLookup")
+activate api
+Rel(api, redis, "GET ...", "", "", "", "CacheLookup")
+Rel(redis, api, "**HIT** (данные из кеша)", "", "", "", "CacheHit", "", "", "-->")
+note right of api
+  Нет запроса к БД!
+  N-1 операторов получают
+  данные из кеша
+end note
+Rel(api, ui, "200 OK", "", "", "", "", "", "", "-->")
+deactivate api
+Rel(ui, op, "список заказов **<100 мс**", "", "", "", "", "", "", "-->")
+deactivate ui
+
+note over op, db
+  **Результат:**
+  Без кеша: N запросов к БД
+  С кешем: 1 запрос к БД
+  **Снижение нагрузки: Nx**
+end note
+
+legend left
+|<back:C_LINE>              </back>| Стандартная граница |
+|<back:C_ORANGE400>             </back>| Оркестратор Cache-Aside |
+|<back:C_EMERALD400>            </back>| Cache store (Redis) |
+|<back:C_AMBER400>              </back>| Primary store (MES DB) |
+endlegend
+
+@enduml
