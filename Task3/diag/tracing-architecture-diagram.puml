@@ -1,0 +1,89 @@
+@startuml
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+
+!pragma layout smetana
+!include p3-c4-styles.puml
+
+LAYOUT_TOP_DOWN()
+
+AddElementTag("TracingNew", $borderColor=C_ROSE500, $fontColor=C_TEXT)
+AddRelTag("TracingLink", $lineColor=C_ROSE500)
+
+' Внешние персоны
+Person(customer, "Customer", "Покупатель ювелирных изделий через интернет-магазин")
+Person(api_user, "API user", "B2B клиент MES API для расчета стоимости изделий")
+
+' Внутренние персоны
+Person_Ext(seller, "Seller", "Operates with order, confirms manufacturing for the user")
+Person_Ext(operator, "Operator", "Takes order in work, manufactures jewerly")
+
+System_Boundary(jewerly_system, "Jewerly Store System") {
+    ' Веб-контейнеры (существующие)
+    Container(internet_shop, "Internet Shop", "Vue, TypeScript, Threejs", "User can make an order, upload 3d model, work in 3d editor")
+
+    Container(shop_api, "Shop API", "SpringBoot, OpenTelemetry SDK", "- provide list of shop items\n- receives user generated or uploaded 3d file\n- save information about order from customer perspective\n- instrumented with OpenTelemetry")
+
+    Container(crm, "CRM", "Vue, Typescript", "Управление заказами селлерами, подтверждение производства")
+
+    Container(crm_api, "CRM API", "SpringBoot, OpenTelemetry SDK", "- Manages orders\n- Instrumented with OpenTelemetry")
+
+    Container(mes, "MES", "React, typescript", "provide interface to assign orders on operators, shows list of orders")
+
+    Container(mes_api, "MES API", "C#, OpenTelemetry SDK", "- Assigns orders on operators\n- Shows list of orders\n- Calculates price of the order\n- Instrumented with OpenTelemetry")
+
+    Container(files_storage, "3d files storage", "S3-based storage", "stores 3d files so that can be calculated")
+
+    ContainerQueue(messages_queue, "Messages Queue", "RabbitMQ", "Send messages about new orders, changes of statuses between containers, has several topics\n- Trace context propagation via message headers")
+
+    ContainerDb(shop_db, "Shop DB", "PostgreSQL", "Holds main information about work with customers and its orders")
+
+    ContainerDb(mes_db, "MES db", "PostgreSQL", "Holds information about orders, its assignments on operators and statuses from MES perspective")
+
+    ' НОВЫЕ КОМПОНЕНТЫ ТРЕЙСИНГА (красным)
+    Container(otel_collector, "OpenTelemetry Collector", "OTEL Collector", "- Receives traces from applications via OTLP\n- Batching and processing\n- Exports to Jaeger", $tags="TracingNew")
+
+    Container(jaeger_collector, "Jaeger Collector", "Jaeger", "- Receives traces from OTEL Collector\n- Stores in Elasticsearch", $tags="TracingNew")
+
+    Container(jaeger_query, "Jaeger Query & UI", "Jaeger", "- Query API for traces\n- Web UI for visualization\n- Accessible via VPN + OAuth2", $tags="TracingNew")
+
+    ContainerDb(elasticsearch, "Elasticsearch", "Elasticsearch 8.x", "- Stores traces\n- Retention: 7 days detailed, 30 days sampled", $tags="TracingNew")
+}
+
+' Существующие связи
+Rel(customer, internet_shop, "Uses", "HTTPS")
+Rel(internet_shop, shop_api, "API calls", "HTTPS")
+Rel(shop_api, shop_db, "Reads/Writes", "SQL")
+Rel(shop_api, files_storage, "Uploads 3D models", "S3 API")
+
+Rel(seller, crm, "Manages orders", "HTTPS")
+Rel(crm, crm_api, "API calls", "HTTPS")
+Rel(crm_api, shop_db, "Reads/Writes", "SQL")
+Rel(crm_api, messages_queue, "Publishes/Consumes messages", "AMQP")
+BiRel(crm_api, files_storage, "Reads 3D models", "S3 API")
+
+Rel(api_user, mes_api, "B2B API", "HTTPS")
+Rel(mes_api, files_storage, "Reads/Writes 3D models", "S3 API")
+BiRel(mes_api, messages_queue, "Publishes/Consumes messages\n+ trace context", "AMQP")
+Rel(mes_api, mes_db, "Reads/Writes", "SQL")
+
+Rel(mes, mes_api, "API calls", "HTTPS")
+Rel(operator, mes, "Works with orders", "HTTPS")
+
+' НОВЫЕ СВЯЗИ ДЛЯ ТРЕЙСИНГА (красным)
+Rel(shop_api, otel_collector, "Exports traces", "OTLP/gRPC", $tags="TracingLink")
+Rel(crm_api, otel_collector, "Exports traces", "OTLP/gRPC", $tags="TracingLink")
+Rel(mes_api, otel_collector, "Exports traces", "OTLP/gRPC", $tags="TracingLink")
+
+Rel(otel_collector, jaeger_collector, "Forwards traces", "gRPC", $tags="TracingLink")
+Rel(jaeger_collector, elasticsearch, "Stores traces", "HTTP", $tags="TracingLink")
+Rel(jaeger_query, elasticsearch, "Queries traces", "HTTP", $tags="TracingLink")
+
+Rel(seller, jaeger_query, "Views traces for debugging\n(OAuth2 + VPN)", "HTTPS", $tags="TracingLink")
+Rel(operator, jaeger_query, "Views traces for debugging\n(OAuth2 + VPN)", "HTTPS", $tags="TracingLink")
+
+legend left
+|<back:C_LINE>              </back>| Standard border |
+|<back:C_ROSE500>               </back>| Tracing border |
+endlegend
+
+@enduml

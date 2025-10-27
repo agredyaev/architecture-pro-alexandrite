@@ -1,0 +1,110 @@
+@startuml
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+
+!pragma layout smetana
+!include p3-c4-styles.puml
+
+LAYOUT_WITH_LEGEND()
+
+AddElementTag("LoggingNew", $borderColor=C_ORANGE400, $fontColor=C_TEXT)
+AddRelTag("LoggingLink", $lineColor=C_ORANGE400)
+
+' Внешние персоны
+Person(customer, "Customer", "Description of external person.")
+Person(api_user, "API user", "Description of external person.")
+
+' Внутренние персоны
+Person_Ext(seller, "Seller", "Operates with order, confirms manufacturing for the user")
+Person_Ext(operator, "Operator", "Takes order in work, manufactures jewerly")
+Person_Ext(devops, "DevOps", "Monitors system health, investigates incidents")
+
+System_Boundary(jewerly_system, "Jewerly Store System") {
+    ' Веб-контейнеры (существующие, теперь со структурированным логированием)
+    Container(internet_shop, "Internet Shop", "Vue, TypeScript, Threejs", "User can make an order, upload 3d model, work in 3d editor")
+
+    Container(shop_api, "Shop API", "SpringBoot, Logback", "- provide list of shop items\n- receives user generated or uploaded 3d file\n- save information about order from customer perspective\n- Structured JSON logging with trace_id")
+
+    Container(crm, "CRM", "Vue, Typescript", "Description of web browser container role/responsibility.")
+
+    Container(crm_api, "CRM API", "SpringBoot, Logback", "- Manages orders\n- Structured JSON logging with trace_id")
+
+    Container(mes, "MES", "React, typescript", "provide interface to assign orders on operators, shows list of orders")
+
+    Container(mes_api, "MES API", "C#, Serilog", "- Assigns orders on operators\n- Shows list of orders\n- Calculates price of the order\n- Structured JSON logging with trace_id")
+
+    Container(files_storage, "3d files storage", "S3-based storage", "stores 3d files so that can be calculated")
+
+    ContainerQueue(messages_queue, "Messages Queue", "RabbitMQ", "Send messages about new orders, changes of statuses between containers, has several topics")
+
+    ContainerDb(shop_db, "Shop DB", "PostgreSQL", "Holds main information about work with customers and its orders\n- PostgreSQL logs enabled")
+
+    ContainerDb(mes_db, "MES db", "PostgreSQL", "Holds information about orders, its assignments on operators and statuses from MES perspective\n- PostgreSQL logs enabled")
+
+' НОВЫЕ КОМПОНЕНТЫ ЛОГИРОВАНИЯ
+    Container(promtail_shop, "Promtail (Shop API)", "Promtail", "- Collects logs from Shop API stdout\n- Adds labels: service=shop-api, env=prod\n- Sanitizes PII\n- Pushes to Loki", $tags="LoggingNew")
+
+    Container(promtail_crm, "Promtail (CRM API)", "Promtail", "- Collects logs from CRM API stdout\n- Adds labels: service=crm-api, env=prod\n- Sanitizes PII\n- Pushes to Loki", $tags="LoggingNew")
+
+    Container(promtail_mes, "Promtail (MES API)", "Promtail", "- Collects logs from MES API stdout\n- Adds labels: service=mes-api, env=prod\n- Sanitizes PII\n- Pushes to Loki", $tags="LoggingNew")
+
+    Container(promtail_infra, "Promtail (Infrastructure)", "Promtail", "- Collects RabbitMQ logs\n- Collects PostgreSQL logs\n- Adds infrastructure labels\n- Pushes to Loki", $tags="LoggingNew")
+
+    Container(loki, "Grafana Loki", "Loki", "- Receives logs from Promtail agents\n- Label-based indexing\n- Stores logs in S3\n- Retention: 30d INFO, 90d ERROR", $tags="LoggingNew")
+
+    Container(grafana, "Grafana", "Grafana", "- Unified dashboard for logs (Loki)\n- Unified dashboard for metrics (Prometheus)\n- Unified dashboard for traces (Jaeger)\n- Log search and filtering\n- Alerting rules\n- OAuth2 + VPN access", $tags="LoggingNew")
+
+    ContainerDb(s3_storage, "S3 Storage", "MinIO / AWS S3", "- Stores compressed logs\n- Long-term storage with retention policy", $tags="LoggingNew")
+
+    Container(alertmanager, "Alertmanager", "Prometheus Alertmanager", "- Receives alerts from Grafana\n- Routes to Slack\n- Deduplication and grouping", $tags="LoggingNew")
+}
+
+' Существующие связи
+Rel(customer, internet_shop, "Uses", "HTTPS")
+Rel(internet_shop, shop_api, "API calls", "HTTPS")
+Rel(shop_api, shop_db, "Reads/Writes", "SQL")
+Rel(shop_api, files_storage, "Uploads 3D models", "S3 API")
+
+Rel(seller, crm, "Manages orders", "HTTPS")
+Rel(crm, crm_api, "API calls", "HTTPS")
+Rel(crm_api, shop_db, "Reads/Writes", "SQL")
+Rel(crm_api, messages_queue, "Publishes/Consumes messages", "AMQP")
+BiRel(crm_api, files_storage, "Reads 3D models", "S3 API")
+
+Rel(api_user, mes_api, "B2B API", "HTTPS")
+Rel(mes_api, files_storage, "Reads/Writes 3D models", "S3 API")
+BiRel(mes_api, messages_queue, "Publishes/Consumes messages", "AMQP")
+Rel(mes_api, mes_db, "Reads/Writes", "SQL")
+
+Rel(mes, mes_api, "API calls", "HTTPS")
+Rel(operator, mes, "Works with orders", "HTTPS")
+
+' НОВЫЕ СВЯЗИ ДЛЯ ЛОГИРОВАНИЯ
+Rel(shop_api, promtail_shop, "Logs to stdout", "JSON", $tags="LoggingLink")
+Rel(crm_api, promtail_crm, "Logs to stdout", "JSON", $tags="LoggingLink")
+Rel(mes_api, promtail_mes, "Logs to stdout", "JSON", $tags="LoggingLink")
+
+Rel(messages_queue, promtail_infra, "RabbitMQ logs", "TEXT", $tags="LoggingLink")
+Rel(shop_db, promtail_infra, "PostgreSQL logs", "TEXT", $tags="LoggingLink")
+Rel(mes_db, promtail_infra, "PostgreSQL logs", "TEXT", $tags="LoggingLink")
+
+Rel(promtail_shop, loki, "Push logs", "HTTP/Protobuf", $tags="LoggingLink")
+Rel(promtail_crm, loki, "Push logs", "HTTP/Protobuf", $tags="LoggingLink")
+Rel(promtail_mes, loki, "Push logs", "HTTP/Protobuf", $tags="LoggingLink")
+Rel(promtail_infra, loki, "Push logs", "HTTP/Protobuf", $tags="LoggingLink")
+
+Rel(loki, s3_storage, "Stores chunks", "S3 API", $tags="LoggingLink")
+Rel(grafana, loki, "Queries logs", "HTTP", $tags="LoggingLink")
+
+Rel(grafana, alertmanager, "Sends alerts", "HTTP", $tags="LoggingLink")
+Rel(alertmanager, devops, "Notifies via Slack", "HTTPS", $tags="LoggingLink")
+
+Rel(devops, grafana, "Views logs, searches by trace_id\n(OAuth2 + VPN)", "HTTPS", $tags="LoggingLink")
+Rel(seller, grafana, "Views logs for debugging\n(OAuth2 + VPN)", "HTTPS", $tags="LoggingLink")
+Rel(operator, grafana, "Views logs for debugging\n(OAuth2 + VPN)", "HTTPS", $tags="LoggingLink")
+
+legend left
+|<back:C_LINE>              </back>| Standard border |
+|<back:C_ORANGE400>             </back>| Logging border |
+endlegend
+
+@enduml
